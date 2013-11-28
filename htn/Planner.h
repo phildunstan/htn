@@ -14,21 +14,57 @@
 //-----------------------------------------------------------------------------
 // Tracing Framework
 //-----------------------------------------------------------------------------
-template <typename Domain>
+template <typename StateType, typename PlanType>
 class PlannerTrace
 {
 public:
-    static PlannerTrace& getInstance()
+    virtual ~PlannerTrace() {}
+    virtual void begin() = 0;
+    virtual void end(const optional<PlanType>& result) = 0;
+    virtual void pushContext(std::string context, const StateType& state, std::string file, int line) = 0;
+    virtual void popContext() = 0;
+    virtual void primitive(std::string name, const StateType& state, std::string file, int line) = 0;
+    virtual void fail(std::string file, int line) = 0;
+
+    class AutoContext
     {
-        static PlannerTrace trace;
-        return trace;
+    public:
+        AutoContext(PlannerTrace& trace, const std::string& context, const StateType& state, std::string file, int line)
+            : m_trace(&trace)
+        {
+            m_trace->pushContext(context, state, std::move(file), line);
+        }
+
+        ~AutoContext()
+        {
+            m_trace->popContext();
+        }
+
+        PlannerTrace* m_trace;
+    };
+};
+
+template <typename StateType, typename PlanType>
+class NullPlannerTrace : public PlannerTrace<StateType, PlanType>
+{
+public:
+    virtual void begin() override {}
+    virtual void end(const optional<PlanType>&) override {}
+    virtual void pushContext(std::string, const StateType&, std::string, int) override {}
+    virtual void popContext() override {}
+    virtual void primitive(std::string, const StateType&, std::string, int) override {}
+    virtual void fail(std::string, int) override {}
+};
+
+template <typename StateType, typename PlanType>
+class StdoutPlannerTrace : public PlannerTrace<StateType, PlanType>
+{
+public:
+    virtual void begin() override
+    {
     }
 
-    void begin()
-    {
-    }
-
-    void end(const optional<typename Domain::Plan>& result)
+    virtual void end(const optional<PlanType>& result) override
     {
         if (!result)
         {
@@ -36,14 +72,14 @@ public:
         }
         else
         {
-            const auto& tasks = result.get().first;
             std::cout << "Planning succeeded! ";
-            std::copy(std::begin(tasks), std::end(tasks), std::ostream_iterator<std::string>(std::cout, " "));
+            // const auto& tasks = result.get().first;
+            // std::copy(std::begin(tasks), std::end(tasks), std::ostream_iterator<std::string>(std::cout, " "));
             std::cout << std::endl;
         }
     }
 
-    void pushContext(std::string context, typename Domain::State state, std::string file, int line)
+    virtual void pushContext(std::string context, const StateType& state, std::string file, int line) override
     {
         m_contexts.emplace_back(make_pair(std::move(context), state));
         std::cout << file << "(" << line << ") Planning context: ";
@@ -54,12 +90,23 @@ public:
         std::cout << std::endl;
     }
 
-    void popContext()
+    virtual void popContext() override
     {
         m_contexts.pop_back();
     }
 
-    void fail(std::string file, int line)
+    virtual void primitive(std::string name, const StateType& state, std::string file, int line) override
+    {
+        m_contexts.emplace_back(make_pair(std::move(name), state));
+        std::cout << file << "(" << line << ") Planning context: ";
+        for (auto c : m_contexts)
+        {
+            std::cout << c.first << " ";
+        }
+        std::cout << std::endl;
+    }
+
+    virtual void fail(std::string file, int line) override
     {
         std::cout << file << "(" << line << ") Planning failed: ";
         for (auto context : m_contexts)
@@ -70,135 +117,134 @@ public:
         std::cout << "(" << m_contexts.rbegin()->second.toString() << ")" << std::endl;
     }
 
-    class AutoContext
-    {
-    public:
-        AutoContext(const std::string& context, typename Domain::State state, std::string file, int line)
-        {
-            PlannerTrace::getInstance().pushContext(context, std::move(state), std::move(file), line);
-        }
-
-        ~AutoContext()
-        {
-            PlannerTrace::getInstance().popContext();
-        }
-    };
-
 private:
-    PlannerTrace()
-    {
-    }
-
-    std::vector<std::pair<std::string, typename Domain::State>> m_contexts;
+    std::vector<std::pair<std::string, StateType>> m_contexts;
 };
 
-#define PLANNER_TRACE_BEGIN() Trace::getInstance().begin()
-#define PLANNER_TRACE_END(RESULT) Trace::getInstance().end(RESULT)
-#define PLANNER_TRACE_CONTEXT(CONTEXT_NAME, STATE) Trace::AutoContext PlannerTraceAutoContext(CONTEXT_NAME, STATE, __FILE__, __LINE__)
-#define PLANNER_TRACE_FAIL() Trace::getInstance().fail(__FILE__, __LINE__)
 
 
+#define ENABLE_PLANNER_TRACE
+#if defined(ENABLE_PLANNER_TRACE)
+#define PLANNER_TRACE_BEGIN(TRACE, DOMAIN) (TRACE).begin()
+#define PLANNER_TRACE_END(TRACE, DOMAIN, PLAN) (TRACE).end(PLAN)
+#define PLANNER_TRACE_CONTEXT(TRACE, CONTEXT_NAME, STATE) Trace::AutoContext PlannerTraceAutoContext((TRACE), (CONTEXT_NAME), (STATE), __FILE__, __LINE__)
+#define PLANNER_TRACE_PRIMITIVE(TRACE, PRIMITIVE_NAME, STATE) (TRACE).primitive((PRIMITIVE_NAME), (STATE), __FILE__, __LINE__)
+#define PLANNER_TRACE_FAIL(TRACE) (TRACE).fail(__FILE__, __LINE__)
+#else
+#define PLANNER_TRACE_BEGIN(TRACE)
+#define PLANNER_TRACE_END(TRACE, PLAN)
+#define PLANNER_TRACE_CONTEXT(TRACE, CONTEXT_NAME, STATE)
+#define PLANNER_TRACE_PRIMITIVE(TRACE, PRIMITIVE_NAME, STATE)
+#define PLANNER_TRACE_FAIL(TRACE)
+#endif
 
-template <typename StateType>
+
+template <typename StateType, typename PrimitiveType>
 class Domain
 {
 public:
     typedef StateType State;
+    typedef PrimitiveType Primitive;
 
-    // A plan is represented as a string of operators (actions) and the
+    // A plan is represented as a list of primitives (actions) and the
     // final state after executing the plan.
-    typedef std::pair<std::vector<std::string>, State> Plan;
+    typedef std::vector<Primitive> Plan;
 
-    typedef PlannerTrace<Domain<State>> Trace;
+    typedef PlannerTrace<State, Plan> Trace;
 
 
     //-------------------------------------------------------------------------
     // Generic HTN infrastructure
     //-------------------------------------------------------------------------
+    typedef optional<Plan>(Domain::*Task)(State&);
 
     struct null_action
     {
-        optional<Plan> operator()(State state)
+        optional<Plan> operator()(State&, Trace&)
         {
-            return optional<Plan>(Plan{std::vector<std::string>{}, state});
+            return make_optional(Plan());
         }
     };
 
-    static optional<Plan> simple_postcondition(State state, std::string name)
+    static optional<Plan> primitive(Primitive func, Trace&)
     {
-        return make_optional(Plan(std::vector<std::string>{name}, state));
+        return make_optional(Plan({func}));
     }
 
-    // A selector will search each of the child branches until it finds
+    // A methods will search each of the child methods until it finds
     // a branch for which all of the preconditions are met.
-    // If none of the branches can succeed then the selector itself fails.
+    // If none of the methods can succeed then the methods itself fails.
     template <typename Action>
-    static optional<Plan> selector(State state)
+    static optional<Plan> methods(State& state, const State& old_state, Trace& trace)
     {
-        auto plan = Action()(state); // test the action
+        auto plan = Action()(state, trace); // test the action
         if (plan)
         {
             return plan; // if a plan can be made for the action return it
         }
         else
         {
-            PLANNER_TRACE_FAIL();
+            state = old_state;
+            PLANNER_TRACE_FAIL(trace);
             return optional<Plan>();
         }
     }
 
-    // A selector will try each of the child branches until it finds a branch
+    // A methods will try each of the child methods until it finds a branch
     // which can satisfy the goal. In HTN parlance this are called methods.
     template <typename Action1, typename Action2, typename... Actions>
-    static optional<Plan> selector(State state)
+    static optional<Plan> methods(State& state, const State& old_state, Trace& trace)
     {
-        auto plan = Action1()(state); // test the first action
+        auto plan = Action1()(state, trace); // test the first action
         if (plan)
         {
-            return plan; // if a plan can be made for the first action return it
+            return plan; // if a plan can be made for the first task return it
         }
         else
         {
-            return selector<Action2, Actions...>(state); // otherwise, recurse
+            state = old_state; // reset the state before trying the next method
+            return methods<Action2, Actions...>(state, old_state, trace); // otherwise, recurse
         }
     }
 
-    // A sequence will search each of the child branches sequentially.
-    // The final plan is the concatenation of the plans for each child branch.
-    // If any of the branches fail then the sequence itself fails.
+    // Search a task list.
+    // The final plan is the concatenation of the plans for each task in the task list.
+    // If any of the tasks fail then this method fails.
     template <typename Action>
-    static optional<Plan> sequence(State state)
+    static optional<Plan> tasks(State& state, const State& old_state, Trace& trace)
     {
-        auto plan = Action()(state); // expand the first child
+        auto plan = Action()(state, trace); // test the first task
         if (plan)
         {
             return plan;
         }
         else
         {
-            // return failure if any of the branches fail.
-            PLANNER_TRACE_FAIL();
+            // return failure if any of the tasks fail.
+            PLANNER_TRACE_FAIL(trace);
+            state = old_state;
             return optional<Plan>();
         }
     }
 
     template <typename Action1, typename Action2, typename... Actions>
-    static optional<Plan> sequence(State state)
+    static optional<Plan> tasks(State state, const State& old_state, Trace& trace)
     {
-        auto plan = Action1()(state); // expand the first child
+        auto plan = Action1()(state, trace); // test the first task
         if (plan)
         {
-            // recursively expand the remaining branches
-            auto tail_plan = sequence<Action2, Actions...>(plan.get().second);
+            // recursively expand the remaining task list
+            auto tail_plan = tasks<Action2, Actions...>(state, old_state, trace);
             if (tail_plan)
             {
-                // join the plans of each of the child branches.
-                std::copy(std::begin(tail_plan.get().first), std::end(tail_plan.get().first), std::back_inserter(plan.get().first));
-                return make_optional(Plan{plan.get().first, tail_plan.get().second});
+                // join the plans of each of the tasks.
+                std::copy(std::cbegin(tail_plan.get()), std::cend(tail_plan.get()), std::back_inserter(plan.get()));
+                return plan;
             }
         }
-        // return failure if any of the branches fail.
-        PLANNER_TRACE_FAIL();
+        // return failure if any of the tasks fail.
+        PLANNER_TRACE_FAIL(trace);
+        state = old_state;
         return optional<Plan>();
     }
 
@@ -208,31 +254,39 @@ public:
     #define _begin(NAME)                                                       \
         struct NAME                                                            \
         {                                                                      \
-            optional<Plan> operator()(State state)                             \
+            optional<Plan> operator()(State& state, Trace& trace)              \
             {                                                                  \
-                PLANNER_TRACE_CONTEXT(#NAME, state);
+                PLANNER_TRACE_CONTEXT(trace, #NAME, state);
 
     #define _variable(NAME, EXPR)                                              \
-        auto NAME = (EXPR);
+                auto NAME = (EXPR);
 
     #define _precondition(EXPR)                                                \
-        if (!(EXPR))                                                           \
-        {                                                                      \
-            PLANNER_TRACE_FAIL();                                              \
-            return optional<Plan>();                                           \
-        }   
+                if (!(EXPR))                                                   \
+                {                                                              \
+                    PLANNER_TRACE_FAIL(trace);                                 \
+                    return optional<Plan>();                                   \
+                }   
 
-    #define _postcondition(EXPR)                                               \
-        EXPR;    
+    // don't mix operations and methods or tasks
+    // we don't correctly roll back the state change if this is done before
+    // a methods or tasks call.
+    #define _operation(EXPR)                                                   \
+                {                                                              \
+                    EXPR;                                                      \
+                }   
 
-    #define _sequence(...)                                                     \
-        return sequence<__VA_ARGS__>(state);
+    #define _methods(...)                                                      \
+                State old_state = state;                                       \
+                return methods<__VA_ARGS__>(state, old_state, trace);
 
-    #define _selector(...)                                                     \
-        return selector<__VA_ARGS__>(state);
+    #define _tasks(...)                                                        \
+                State old_state = state;                                       \
+                return tasks<__VA_ARGS__>(state, old_state, trace);
 
-    #define _primitive(NAME)                                                   \
-        return simple_postcondition(state, NAME);
+    #define _primitive(PRIMITIVE)                                              \
+                PLANNER_TRACE_PRIMITIVE(trace, #PRIMITIVE, state);             \
+                return primitive(PRIMITIVE, trace);
 
     #define _end                                                               \
             }                                                                  \
@@ -241,17 +295,17 @@ public:
 }; // class Planner
 
 
-    
-template <typename Domain, typename RootAction>
-optional<typename Domain::Plan> findPlan(typename Domain::State state)
+// Search the domain for a valid plan.
+template <typename DomainType, typename RootAction, typename TraceType>
+optional<typename DomainType::Plan> findPlan(typename DomainType::State state, TraceType& trace)
 {
-    Domain::PLANNER_TRACE_BEGIN();
-    auto plan = RootAction()(state);
-    Domain::PLANNER_TRACE_END(plan);
+    PLANNER_TRACE_BEGIN(trace, domain);
+    auto plan = RootAction()(state, trace);
+    PLANNER_TRACE_END(trace, domain, plan);
     return plan;
 }
 
-#define _findPlan(DOMAIN, ACTION, STATE) findPlan<DOMAIN, DOMAIN::ACTION>(STATE);
+#define _findPlan(DOMAIN, ACTION, STATE, TRACE) findPlan<DOMAIN, DOMAIN::ACTION>((STATE), (TRACE));
 
 
 #endif // PLANNER_H
